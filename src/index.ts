@@ -1,5 +1,13 @@
 export { SnapshotArchive, openArchive } from './archive.js';
-export { AsyncMutex, RootCoordinator, coordinatorForRoot } from './coordinator.js';
+export {
+  AsyncMutex,
+  RootCoordinator,
+  coordinatorForRoot,
+  resetCoordinatorRegistryForTests,
+  probeSqliteLockHeld,
+  isSqliteBusyError,
+} from './coordinator.js';
+export type { ActiveOperation, LeaseFileData, LeaseContribution, OperationKind } from './coordinator.js';
 export {
   ErrorCode,
   QuotaExceededError,

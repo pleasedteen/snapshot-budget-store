@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { coordinatorForRoot, type RootCoordinator } from './coordinator.js';
@@ -103,10 +104,18 @@ export class SnapshotArchive {
       ...shards.slice(0, 16).map((shard) => ensureDirectory(path.join(objectsDirectory, shard))),
     ]);
 
-    const db = openDatabase(path.join(root, 'archive.sqlite'));
     const coordinator = coordinatorForRoot(root);
-    const archive = new SnapshotArchive(root, db, coordinator, options.crashPoint);
-    archive.initializeQuota(options.quotaBytes);
+    await coordinator.ensureLayout();
+
+    // Database creation/migration and quota initialization take the same
+    // cross-process critical section as every other catalog mutation, so
+    // several processes may safely open a brand-new root concurrently.
+    const archive = await coordinator.withExclusive(() => {
+      const db = openDatabase(path.join(root, 'archive.sqlite'));
+      const instance = new SnapshotArchive(root, db, coordinator, options.crashPoint);
+      instance.initializeQuota(options.quotaBytes);
+      return instance;
+    });
     return archive;
   }
 
@@ -137,11 +146,11 @@ export class SnapshotArchive {
 
   async setQuota(quotaBytes: number | null): Promise<QuotaInfo> {
     this.checkOpen();
-    await this.coordinator.mutex.runExclusive(() => {
+    return this.coordinator.withExclusive(() => {
       this.checkOpen();
       this.setQuotaSync(quotaBytes);
+      return this.getQuotaInfo();
     });
-    return this.getQuotaInfo();
   }
 
   private readQuotaBytes(): number | undefined {
@@ -260,7 +269,7 @@ export class SnapshotArchive {
   async setRetention(versionId: string, retained: RetentionValue): Promise<VersionSummary> {
     this.checkOpen();
     const shouldRetain = isRetainedValue(retained);
-    return this.coordinator.mutex.runExclusive(() => {
+    return this.coordinator.withExclusive(() => {
       this.checkOpen();
       const row = this.requireVersionRow(versionId);
       this.db.prepare(`UPDATE versions SET pinned = ? WHERE id = ?`).run(shouldRetain ? 1 : 0, versionId);
@@ -300,9 +309,14 @@ export class SnapshotArchive {
     this.checkOpen();
 
     const sourceRoot = path.resolve(sourceDirectory);
-    const operation = this.coordinator.startOperation('create-snapshot');
-    const operationStagingDirectory = path.join(this.stagingDirectory, operation.id);
-    operation.scratchDirs.add(operationStagingDirectory);
+    const operationId = randomUUID();
+    const operationStagingDirectory = path.join(this.stagingDirectory, operationId);
+    // The durable lease exists before the staging directory is created, so a
+    // concurrent GC in another process can never observe an unprotected stage.
+    const operation = await this.coordinator.beginOperation('create-snapshot', {
+      id: operationId,
+      scratchDirs: [operationStagingDirectory],
+    });
     const stageObjectsDirectory = path.join(operationStagingDirectory, 'objects');
 
     try {
@@ -350,6 +364,9 @@ export class SnapshotArchive {
       }
 
       entries.sort((a, b) => a.path.localeCompare(b.path));
+      // Make the fully prepared blob set visible in the durable lease before
+      // blocking on the test/diagnostic barrier.
+      await this.coordinator.writeLease(operation);
       await options.hooks?.beforePublish?.();
 
       const prepared: PreparedSnapshot = {
@@ -363,10 +380,13 @@ export class SnapshotArchive {
         options,
       };
 
-      return await this.coordinator.mutex.runExclusive(() => this.publishPrepared(prepared));
+      return await this.coordinator.withExclusive(() => this.publishPrepared(prepared));
     } finally {
-      this.coordinator.finishOperation(operation.id);
-      await fs.rm(operationStagingDirectory, { recursive: true, force: true });
+      try {
+        await fs.rm(operationStagingDirectory, { recursive: true, force: true });
+      } finally {
+        await this.coordinator.finishOperation(operation.id);
+      }
     }
   }
 
@@ -508,8 +528,17 @@ export class SnapshotArchive {
     this.maybeCrash('after-commit');
 
     const version = await this.getVersion(versionId);
+    // Report the exact post-commit union computed by the quota planner instead
+    // of re-reading aggregate quota afterwards: across processes another commit
+    // could otherwise land between our COMMIT and the reporting read. The
+    // catalog lock is still held here, so no other process can have committed.
+    const committedQuotaBytes = this.readQuotaBytes();
     const quota: QuotaInfo & { beforeBytes: number } = {
-      ...this.getQuotaInfo(),
+      ...(committedQuotaBytes === undefined ? {} : { quotaBytes: committedQuotaBytes }),
+      usedBytes: plan.afterBytes,
+      ...(committedQuotaBytes === undefined
+        ? {}
+        : { availableBytes: Math.max(0, committedQuotaBytes - plan.afterBytes) }),
       beforeBytes: plan.beforeBytes,
     };
 
@@ -521,12 +550,17 @@ export class SnapshotArchive {
   // ---------------------------------------------------------------------------
 
   private async loadVersionAndLease(versionId: string): Promise<{ details: VersionDetails; operationId: string }> {
-    return this.coordinator.mutex.runExclusive(() => {
+    return this.coordinator.withExclusive(async () => {
       this.checkOpen();
       const row = this.requireVersionRow(versionId);
       const details = this.loadDetails(row);
-      const operation = this.coordinator.startOperation('restore');
-      for (const file of details.files) operation.blobIds.add(file.blobId);
+      // The durable cross-process lease (and its kernel-mediated liveness lock)
+      // is registered before the catalog lock is released. From that instant a
+      // concurrent GC in any process must protect every blob of this manifest,
+      // even if a quota publication evicts the version itself meanwhile.
+      const operation = await this.coordinator.registerOperation('restore', {
+        blobIds: details.files.map((file) => file.blobId),
+      });
       return { details, operationId: operation.id };
     });
   }
@@ -546,7 +580,7 @@ export class SnapshotArchive {
         affectedFiles,
       };
     } finally {
-      this.coordinator.finishOperation(operationId);
+      await this.coordinator.finishOperation(operationId);
     }
   }
 
@@ -577,6 +611,10 @@ export class SnapshotArchive {
       if (await pathExists(targetDir)) throw new TargetExistsError(targetDir);
 
       temporaryDirectory = path.join(parentDir, `.${baseName}.restore-${operationId}`);
+      // Persist the private output directory in the operation lease before
+      // creating it: if this process is killed, another process's GC can find
+      // and remove the leftover directory.
+      await this.coordinator.attachScratchDirectory(operationId, temporaryDirectory);
       await fs.mkdir(temporaryDirectory, { recursive: false });
 
       for (const directory of details.directories) {
@@ -606,9 +644,12 @@ export class SnapshotArchive {
         verified: true,
       };
     } finally {
-      this.coordinator.finishOperation(operationId);
-      if (temporaryDirectory) {
-        await fs.rm(temporaryDirectory, { recursive: true, force: true });
+      try {
+        if (temporaryDirectory) {
+          await fs.rm(temporaryDirectory, { recursive: true, force: true });
+        }
+      } finally {
+        await this.coordinator.finishOperation(operationId);
       }
     }
   }
@@ -665,14 +706,8 @@ export class SnapshotArchive {
 
   async gc(): Promise<GcResult> {
     this.checkOpen();
-    return this.coordinator.mutex.runExclusive(async () => {
+    return this.coordinator.withExclusive(async () => {
       this.checkOpen();
-
-      const referencedRows = this.db.prepare(`SELECT DISTINCT blob_id AS id FROM files`).all() as Array<{
-        id: string;
-      }>;
-      const referenced = new Set(referencedRows.map((row) => row.id));
-      const activeBlobIds = this.coordinator.activeBlobIds();
 
       const result: GcResult = {
         removedBlobIds: [],
@@ -680,6 +715,29 @@ export class SnapshotArchive {
         removedStagingDirs: [],
         removedTemporaryFiles: [],
       };
+
+      // Classify cross-process operation leases first. Dead leases have their
+      // documents/locks reaped here; live leases contribute protected blob and
+      // scratch-directory sets (including operations in other processes).
+      const leases = await this.coordinator.collectLeasesForGc();
+
+      const referencedRows = this.db.prepare(`SELECT DISTINCT blob_id AS id FROM files`).all() as Array<{
+        id: string;
+      }>;
+      const referenced = new Set(referencedRows.map((row) => row.id));
+      const activeBlobIds = this.coordinator.activeBlobIds();
+      for (const blobId of leases.liveBlobIds) activeBlobIds.add(blobId);
+
+      // Remove scratch directories recorded by dead leases (this covers restore
+      // temp directories outside the archive root as well as staging dirs).
+      const removedScratch = new Set<string>();
+      for (const scratchDirectory of leases.deadScratchDirs) {
+        if (!this.isSafeDeadScratchPath(scratchDirectory)) continue;
+        if (removedScratch.has(scratchDirectory)) continue;
+        removedScratch.add(scratchDirectory);
+        await fs.rm(scratchDirectory, { recursive: true, force: true });
+        result.removedStagingDirs.push(scratchDirectory);
+      }
 
       let shardEntries: import('node:fs').Dirent[] = [];
       try {
@@ -753,13 +811,39 @@ export class SnapshotArchive {
       for (const entry of stagingEntries) {
         if (!entry.isDirectory()) continue;
         const stagingPath = path.join(this.stagingDirectory, entry.name);
+        const resolvedStagingPath = path.resolve(stagingPath);
         if (this.coordinator.isScratchDirectoryActive(stagingPath)) continue;
+        if (leases.liveScratchDirs.has(resolvedStagingPath)) continue;
+        if (removedScratch.has(resolvedStagingPath)) continue;
         await fs.rm(stagingPath, { recursive: true, force: true });
         result.removedStagingDirs.push(stagingPath);
       }
 
       return result;
     });
+  }
+
+  /**
+   * Validate a scratch path taken from a dead process's lease before removing
+   * it recursively. Lease documents are local trusted data, but this guard
+   * ensures a corrupt/tampered document can never point a recursive delete at
+   * an unrelated system directory.
+   */
+  private isSafeDeadScratchPath(candidate: string): boolean {
+    if (typeof candidate !== 'string' || candidate.length === 0 || candidate.includes('\0')) return false;
+    const resolved = path.resolve(candidate);
+    const root = path.parse(resolved).root;
+    if (resolved === root) return false;
+
+    const stagingRoot = path.resolve(this.stagingDirectory);
+    if (resolved === stagingRoot) return false;
+    if (resolved.startsWith(stagingRoot + path.sep)) return true;
+
+    const baseName = path.basename(resolved);
+    // Restore temps are ".<target-name>.restore-<operation-uuid>".
+    if (baseName.startsWith('.') && baseName.includes('.restore-')) return true;
+
+    return false;
   }
 
   /** Friendly alias for garbage collection. */
