@@ -1,0 +1,10 @@
+{
+  "version": 8,
+  "name": "field-map-v1.1",
+  "layers": [
+    "land",
+    "water",
+    "roads",
+    "labels"
+  ]
+}

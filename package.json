@@ -1,0 +1,45 @@
+{
+  "name": "offline-map-snapshot-lab",
+  "version": "1.0.0",
+  "description": "Local, content-deduplicated snapshot archive for offline map workstation build artifacts.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.8.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "fixtures",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "pretest": "npm run build",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec dist/test/*.test.js",
+    "predemo": "npm run build",
+    "demo": "node --disable-warning=ExperimentalWarning dist/demo/run-demo.js",
+    "verify": "npm run build && node --disable-warning=ExperimentalWarning --test --test-reporter=spec dist/test/*.test.js && node --disable-warning=ExperimentalWarning dist/demo/run-demo.js"
+  },
+  "keywords": [
+    "snapshot",
+    "backup",
+    "content-addressed",
+    "deduplication",
+    "offline-maps",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.20.7",
+    "typescript": "^5.9.3"
+  }
+}
